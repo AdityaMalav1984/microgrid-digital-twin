@@ -71,7 +71,8 @@ class MicroGridDigitalTwin:
             'total_cost': new_state['total_cost']
         }
         
-        self.historical_data = self.historical_data.append(new_record, ignore_index=True)
+        new_df = pd.DataFrame([new_record])
+        self.historical_data = pd.concat([self.historical_data, new_df], ignore_index=True)
         self.current_state = new_state
         
         return new_state, battery_setpoint, generator_setpoint

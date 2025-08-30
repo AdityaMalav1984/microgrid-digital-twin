@@ -231,4 +231,4 @@ def update_dashboard(n_intervals, data):
     return power_fig, battery_gauge, cost_metric, power_metrics
 
 if __name__ == '__main__':
-    app.run_server(debug=True, port=8050)
+    app.run(debug=True, port=8050)

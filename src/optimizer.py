@@ -1,123 +1,166 @@
 import numpy as np
-from scipy.optimize import linprog
+from scipy.optimize import minimize, Bounds, LinearConstraint
+import pandas as pd
 
-class MicroGridOptimizer:
+class AdvancedMicroGridOptimizer:
     def __init__(self):
         self.battery_min_soc = 20  # %
         self.battery_max_soc = 95  # %
         self.battery_capacity = 10  # kWh
-        self.generator_max_power = 5  # kW
-        self.time_step = 1  # hours
+        self.battery_max_power = 5  # kW charge/discharge rate
+        self.generator_max_power = 8  # kW
+        self.generator_min_power = 1  # kW (minimum stable generation)
+        self.generator_efficiency = 0.35
+        self.fuel_cost = 0.25  # $/kWh
+        self.grid_export_price = 0.08  # $/kWh (feed-in tariff)
+        self.carbon_intensity_grid = 0.5  # kgCO2/kWh
+        self.carbon_intensity_generator = 0.7  # kgCO2/kWh
         
-    def optimize_schedule(self, solar_forecast, load_forecast, current_soc, 
-                          electricity_prices, fuel_cost=0.25):
+    def multi_objective_optimization(self, solar_forecast, load_forecast, current_soc, 
+                                   electricity_prices, carbon_cost=0.02):
         """
-        Optimize battery and generator operation for the next 24 hours
-        Returns optimal power setpoints for each hour
+        Multi-objective optimization: minimize cost AND carbon emissions
         """
         n_periods = len(solar_forecast)
         
-        # Decision variables: [battery_charge, battery_discharge, generator] for each period
-        n_vars = 3 * n_periods
+        # Decision variables: [battery_power, generator_power] for each period
+        # battery_power > 0: discharging, < 0: charging
+        n_vars = 2 * n_periods
         
-        # Objective function: minimize cost
-        # Cost coefficients: [grid_import * price, generator * fuel_cost, 0 for battery]
-        c = np.concatenate([
-            electricity_prices,  # Cost for grid import
-            np.full(n_periods, fuel_cost),  # Cost for generator
-            np.zeros(n_periods)  # Battery operation has no direct cost
-        ])
-        
-        # Constraints: power balance for each period
-        A_eq = np.zeros((n_periods, n_vars))
-        for i in range(n_periods):
-            A_eq[i, i] = 1  # Battery discharge
-            A_eq[i, i + n_periods] = -1  # Battery charge
-            A_eq[i, i + 2*n_periods] = 1  # Generator
+        # Objective function: weighted sum of cost and emissions
+        def objective(x):
+            cost = 0
+            emissions = 0
             
-        # Power balance: solar + battery_discharge + generator + grid_import = load + battery_charge
-        b_eq = load_forecast - solar_forecast
-        
-        # Battery state of charge constraints
-        A_ineq = np.zeros((2*(n_periods-1), n_vars))
-        b_ineq = np.zeros(2*(n_periods-1))
-        
-        # Build battery SOC constraints
-        for i in range(1, n_periods):
-            # SOC lower bound constraint
-            A_ineq[i-1, :i] = -1  # Cumulative charging
-            A_ineq[i-1, n_periods:n_periods+i] = 1  # Cumulative discharging
-            b_ineq[i-1] = current_soc/100 * self.battery_capacity - self.battery_min_soc/100 * self.battery_capacity
+            for i in range(n_periods):
+                battery_power = x[i]
+                generator_power = x[i + n_periods]
+                
+                # Grid power balance
+                grid_power = load_forecast[i] - solar_forecast[i] - battery_power - generator_power
+                
+                # Cost calculation
+                if grid_power > 0:  # Importing from grid
+                    cost += grid_power * electricity_prices[i] / 1000  # Convert to $
+                else:  # Exporting to grid
+                    cost += grid_power * self.grid_export_price / 1000  # Negative cost
+                
+                # Generator fuel cost
+                cost += (generator_power * self.fuel_cost / self.generator_efficiency) / 1000
+                
+                # Carbon emissions
+                emissions += max(0, grid_power) * self.carbon_intensity_grid / 1000
+                emissions += generator_power * self.carbon_intensity_generator / 1000
             
-            # SOC upper bound constraint
-            A_ineq[i-1 + n_periods-1, :i] = 1  # Cumulative charging
-            A_ineq[i-1 + n_periods-1, n_periods:n_periods+i] = -1  # Cumulative discharging
-            b_ineq[i-1 + n_periods-1] = self.battery_max_soc/100 * self.battery_capacity - current_soc/100 * self.battery_capacity
+            # Weighted objective (cost + carbon_cost * emissions)
+            return cost + carbon_cost * emissions
         
-        # Generator capacity constraints
+        # Constraints
+        constraints = []
+        
+        # Power balance constraint (handled in objective)
+        
+        # Battery SOC constraints
+        soc_trajectory = [current_soc / 100 * self.battery_capacity]  # Start with current SOC in kWh
+        
         for i in range(n_periods):
-            A_ineq = np.vstack([A_ineq, np.zeros(n_vars)])
-            A_ineq[-1, i + 2*n_periods] = 1
-            b_ineq = np.append(b_ineq, self.generator_max_power)
+            next_soc = soc_trajectory[-1] - x[i] / 4  # 15-minute time step assumption
+            soc_trajectory.append(next_soc)
+        
+        # Bounds
+        bounds = Bounds(
+            [-self.battery_max_power] * n_periods + [0] * n_periods,  # Lower bounds
+            [self.battery_max_power] * n_periods + [self.generator_max_power] * n_periods  # Upper bounds
+        )
+        
+        # SOC constraints (20%-95%)
+        def soc_constraint(x):
+            soc = current_soc / 100 * self.battery_capacity
+            constraints = []
             
-            A_ineq = np.vstack([A_ineq, np.zeros(n_vars)])
-            A_ineq[-1, i + 2*n_periods] = -1
-            b_ineq = np.append(b_ineq, 0)
+            for i in range(n_periods):
+                soc -= x[i] / 4  # 15-minute time step
+                constraints.append(soc - self.battery_min_soc/100 * self.battery_capacity)  # Min SOC
+                constraints.append(self.battery_max_soc/100 * self.battery_capacity - soc)  # Max SOC
+            
+            return np.array(constraints)
         
-        # Battery charge/discharge cannot happen simultaneously
-        for i in range(n_periods):
-            A_ineq = np.vstack([A_ineq, np.zeros(n_vars)])
-            A_ineq[-1, i] = 1
-            A_ineq[-1, i + n_periods] = 1
-            b_ineq = np.append(b_ineq, self.battery_capacity/4)  # Max charge/discharge rate
+        # Generator minimum power constraint
+        def generator_constraint(x):
+            return x[n_periods:] - self.generator_min_power  # Generator power >= min_power
         
-        # Solve the linear programming problem
-        bounds = [(0, None) for _ in range(n_vars)]
-        result = linprog(c, A_ub=A_ineq, b_ub=b_ineq, A_eq=A_eq, b_eq=b_eq, bounds=bounds)
+        constraints = [
+            {'type': 'ineq', 'fun': soc_constraint},
+            {'type': 'ineq', 'fun': generator_constraint}
+        ]
+        
+        # Initial guess
+        x0 = np.zeros(n_vars)
+        
+        # Solve optimization
+        result = minimize(objective, x0, method='SLSQP', bounds=bounds, 
+                         constraints=constraints, options={'maxiter': 1000})
         
         if result.success:
-            # Extract results
-            battery_discharge = result.x[:n_periods]
-            battery_charge = result.x[n_periods:2*n_periods]
-            generator = result.x[2*n_periods:3*n_periods]
-            
-            # Net battery power (negative when charging, positive when discharging)
-            battery_power = battery_discharge - battery_charge
-            
-            return battery_power, generator
+            battery_power = result.x[:n_periods]
+            generator_power = result.x[n_periods:]
+            return battery_power, generator_power
         else:
-            raise ValueError("Optimization failed: " + result.message)
+            # Fallback to simple optimization
+            return self.simple_optimization(solar_forecast, load_forecast, current_soc, electricity_prices)
     
-    def get_immediate_setpoints(self, current_conditions, forecast):
-        """
-        Get setpoints for the immediate next time step
-        Simplified version for real-time control
-        """
-        current_soc = current_conditions['battery_soc']
-        current_solar = current_conditions['solar_power']
-        current_load = current_conditions['load_power']
+    def simple_optimization(self, solar_forecast, load_forecast, current_soc, electricity_prices):
+        """Fallback optimization method"""
+        # Simplified optimization logic (similar to previous version)
+        n_periods = len(solar_forecast)
+        battery_power = np.zeros(n_periods)
+        generator_power = np.zeros(n_periods)
         
-        # Calculate power imbalance
-        imbalance = current_load - current_solar
-        
-        # Simple rules-based controller for demonstration
-        if imbalance > 0:  # More load than generation
-            # Use battery if available
-            if current_soc > self.battery_min_soc + 5:  # Keep some reserve
-                battery_power = min(imbalance, self.battery_capacity * 0.2)  # Max discharge rate
-                imbalance -= battery_power
-            else:
-                battery_power = 0
+        for i in range(n_periods):
+            imbalance = load_forecast[i] - solar_forecast[i]
+            
+            if imbalance > 0:  # More load than generation
+                # Use battery first
+                available_battery = min(self.battery_max_power, 
+                                      (current_soc/100 * self.battery_capacity - 
+                                       self.battery_min_soc/100 * self.battery_capacity) * 4)
+                battery_discharge = min(imbalance, available_battery)
+                battery_power[i] = battery_discharge
+                imbalance -= battery_discharge
                 
-            # Use generator for remaining imbalance
-            generator_power = min(imbalance, self.generator_max_power)
-        else:  # Excess generation
-            # Charge battery if not full
-            if current_soc < self.battery_max_soc - 5:  # Leave some headroom
-                battery_power = -min(-imbalance, self.battery_capacity * 0.2)  # Max charge rate
-            else:
-                battery_power = 0
-            generator_power = 0
+                # Use generator for remaining imbalance
+                if imbalance > 0:
+                    generator_power[i] = min(imbalance, self.generator_max_power)
+            
+            else:  # Excess generation
+                # Charge battery
+                available_charging = min(self.battery_max_power,
+                                       (self.battery_max_soc/100 * self.battery_capacity - 
+                                        current_soc/100 * self.battery_capacity) * 4)
+                battery_charge = min(-imbalance, available_charging)
+                battery_power[i] = -battery_charge
+            
+            # Update SOC for next time step
+            current_soc -= battery_power[i] / self.battery_capacity * 100 / 4
         
         return battery_power, generator_power
     
+    def real_time_control(self, current_state, forecast):
+        """Real-time model predictive control"""
+        # Extract current conditions
+        current_soc = current_state['battery_soc']
+        current_solar = current_state['solar_power']
+        current_load = current_state['load_power']
+        
+        # Get short-term forecast (next 4 hours)
+        short_solar = forecast['solar'][:4]
+        short_load = forecast['load'][:4]
+        short_prices = forecast['prices'][:4]
+        
+        # Run optimization for short horizon
+        battery_power, generator_power = self.multi_objective_optimization(
+            short_solar, short_load, current_soc, short_prices
+        )
+        
+        # Return first step actions
+        return battery_power[0], generator_power[0]
